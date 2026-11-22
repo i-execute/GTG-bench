@@ -1,0 +1,88 @@
+name: release
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.4"
+      - run: git clone --depth 1 https://github.com/i-execute/GTG.git ../GTG
+      - run: git -C ../GTG fetch --depth 1 origin 545d0b7f8b1ad0e5ccbc28e9f3d12208e833ba13
+      - run: git -C ../GTG checkout --detach 545d0b7f8b1ad0e5ccbc28e9f3d12208e833ba13
+      - run: go test ./...
+      - run: go vet ./...
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            extension: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            extension: ""
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            extension: .exe
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            extension: .exe
+            archive: zip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.4"
+      - run: git clone --depth 1 https://github.com/i-execute/GTG.git ../GTG
+      - run: git -C ../GTG fetch --depth 1 origin 545d0b7f8b1ad0e5ccbc28e9f3d12208e833ba13
+      - run: git -C ../GTG checkout --detach 545d0b7f8b1ad0e5ccbc28e9f3d12208e833ba13
+      - run: mkdir -p release
+      - run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath -ldflags='-s -w' -o release/gtg-bench${{ matrix.extension }} ./cmd/gtg-bench
+      - run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then version="0.1.0"; fi
+          name="gtg-bench_${version}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then (cd release && zip -q "../${name}.zip" "gtg-bench${{ matrix.extension }}"); else tar -C release -czf "${name}.tar.gz" "gtg-bench${{ matrix.extension }}"; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: target-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: gtg-bench_*
+
+  publish:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - run: git clone --depth 1 https://github.com/i-execute/GTG.git ../GTG
+      - run: git -C ../GTG fetch --depth 1 origin 545d0b7f8b1ad0e5ccbc28e9f3d12208e833ba13
+      - run: git -C ../GTG checkout --detach 545d0b7f8b1ad0e5ccbc28e9f3d12208e833ba13
+      - run: git archive --format=tar --prefix="GTG-bench-${GITHUB_REF_NAME#v}/" HEAD | gzip -n > "release/gtg-bench_${GITHUB_REF_NAME#v}_src.tar.gz"
+      - run: git -C ../GTG archive --format=tar --prefix="GTG/" 545d0b7f8b1ad0e5ccbc28e9f3d12208e833ba13 | gzip -n > release/gtg-545d0b7f8b1ad0e5ccbc28e9f3d12208e833ba13_src.tar.gz
+      - run: cd release && sha256sum * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

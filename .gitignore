@@ -1,0 +1,9 @@
+.cache/
+reports/
+dist/
+*.test
+*.prof
+*.pprof
+*.pgo
+__pycache__/
+*.pyc
