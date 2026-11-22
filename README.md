@@ -41,9 +41,11 @@ go run ./cmd/gtg-bench --full
 go run ./cmd/gtg-bench --fast --no-python --plain
 go run ./cmd/gtg-bench --env
 go run ./cmd/gtg-bench --clean
+go run ./cmd/gtg-bench --resume reports/previous/report.json
+go run ./cmd/gtg-bench --fast --workers 2 --no-python
 ```
 
-`--fast` is a focused, hot-cache smoke comparison through 1 MiB. `--full` covers 16 B through 64 MiB with both hot and cold cache conditions. Every run writes `report.json`, `report.md`, and raw `samples.csv` to a timestamped `reports/` directory unless output paths are supplied.
+`--fast` is a focused, hot-cache smoke comparison through 1 MiB and adds GTG MTProto Seal/Open samples at the same body sizes. `--full` covers 16 B through 64 MiB with both hot and cold cache conditions for AES-IGE and adds GTG MTProto Seal/Open samples. Every run writes `report.json`, `report.md`, and raw `samples.csv` to a timestamped `reports/` directory unless output paths are supplied. Press Ctrl-C to stop after the active measurement: a partial JSON report is saved. Resume it in place with `--resume`; completed raw samples are retained and not repeated.
 
 ## Text screenshot
 
@@ -53,9 +55,9 @@ go run ./cmd/gtg-bench --clean
 ╰──────────────────────────────────────────────────────────────────────╯
   linux/amd64  ·  2 CPUs  ·  AES instructions reported
 
-  1  Fast comparison     focused sizes, hot cache
-  2  Full comparison     16 B to 64 MiB, hot and cold cache
-  3  Environment         CPU, load, power, virtualization
+  1  Fast comparison     AES-256-IGE plus MTProto Seal/Open
+  2  Full comparison     16 B to 64 MiB, paired hot and cold AES
+  3  Environment         CPU, timer, load, power, virtualization
   q  Quit
 ```
 
@@ -74,13 +76,13 @@ The Python harness is generated from a string embedded in the Go binary into a c
 
 For every comparator, direction, cache mode, and size, paired rounds alternate `GTG, comparator, comparator, GTG` and `comparator, GTG, GTG, comparator`. All durations are preserved. The report forms one ratio per paired round as `GTG time / comparator time`, calculates a deterministic bootstrap 95% interval from the complete paired sample set, and does not discard observations. A row says **faster** only when the entire interval is below `0.97`, **slower** only when it is above `1.03`, and **parity** otherwise. Coefficient-of-variation and first-versus-last drift flags are descriptive; they never remove a sample or change that rule.
 
-The terminal reports CPU, architecture, AES acceleration indication, virtualization, power state, and load. Those properties are recorded with results because they can materially alter local timing.
+The terminal reports CPU, architecture, available CPU-frequency and memory metadata, timer resolution, AES acceleration indication, virtualization, power state, and load. Those properties are recorded with results because they can materially alter local timing. The 16-byte and 64-byte AES and MTProto cases calibrate their iteration count against the observed timer resolution before retained measurements begin.
 
 ## Interpretation limits
 
 A result is local to the machine, software versions, process state, and environment stored in that result file. It is not a general performance claim. The end-to-end public call cost intentionally includes each runtime's normal call and output behavior: GTG is timed from Go, while GoyGram, TgCrypto, and cryptg are timed inside CPython. Therefore tiny-message timing includes different Go and CPython call-boundary costs. For bulk analysis, compare the size-regression slope from raw observations rather than converting one short-call result directly into throughput.
 
-The harness does not test protocol integration, networking, Telegram compatibility, memory safety beyond the libraries' public calls, or production readiness. AES-256-IGE is unauthenticated; this is a benchmark, not a recommendation to design new protocols with IGE.
+GTG MTProto Seal/Open measurements cover the public bounded core primitive and are not compared to Python libraries. They are reported as local GTG operation rows, not cross-library rankings. `--workers N` with `N > 1` measures independent GTG AES-IGE workers as one wall-clock worker group, records total operation count and worker count, and disables Python comparator pairs. MTProto Seal/Open rows currently require the default single-worker mode. The harness does not test protocol integration, networking, Telegram compatibility, memory safety beyond the libraries' public calls, or production readiness. AES-256-IGE is unauthenticated; this is a benchmark, not a recommendation to design new protocols with IGE.
 
 ## Releasing and removal
 

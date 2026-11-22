@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 
@@ -17,9 +19,11 @@ func main() {
 	fast := flag.Bool("fast", false, "run focused hot-cache comparison")
 	full := flag.Bool("full", false, "run 16 B to 64 MiB hot/cold comparison")
 	noPython := flag.Bool("no-python", false, "do not initialize Python comparators")
+	workers := flag.Int("workers", 1, "GTG AES-IGE workers; values above one run GTG-only parallel samples")
 	jsonPath := flag.String("json", "", "write JSON report to path")
 	markdownPath := flag.String("markdown", "", "write Markdown report to path")
 	reportDir := flag.String("report-dir", "", "directory for default reports")
+	resumePath := flag.String("resume", "", "resume a partial JSON report in place")
 	plain := flag.Bool("plain", false, "disable terminal styling")
 	environment := flag.Bool("env", false, "print environment and exit")
 	clean := flag.Bool("clean", false, "remove GTG-bench cache and exit")
@@ -28,6 +32,9 @@ func main() {
 	if *showVersion {
 		fmt.Println(version)
 		return
+	}
+	if *workers < 1 {
+		fail(fmt.Errorf("workers must be positive"))
 	}
 	if *clean {
 		root := cacheRoot()
@@ -39,7 +46,7 @@ func main() {
 	}
 	if *environment {
 		env := bench.DetectEnvironment()
-		fmt.Printf("OS: %s\nArchitecture: %s\nGo: %s\nCPUs: %d\nCPU: %s\nAcceleration: %s\nVirtualization: %s\nPower: %s\nLoad: %s\n", env.OS, env.Arch, env.GoVersion, env.CPUs, env.CPUModel, env.Acceleration, env.Virtualization, env.Power, env.Load)
+		fmt.Printf("OS: %s\nArchitecture: %s\nGo: %s\nCPUs: %d\nCPU: %s\nCPU frequency (Hz): %d\nMemory (bytes): %d\nTimer resolution (ns): %d\nAcceleration: %s\nVirtualization: %s\nPower: %s\nLoad: %s\n", env.OS, env.Arch, env.GoVersion, env.CPUs, env.CPUModel, env.CPUFrequencyHz, env.MemoryBytes, env.TimerResolutionNS, env.Acceleration, env.Virtualization, env.Power, env.Load)
 		for _, warning := range env.Warnings {
 			fmt.Println("Warning:", warning)
 		}
@@ -55,7 +62,12 @@ func main() {
 		mode = bench.Full
 		interactive = false
 	}
-	_, err := app.Run(app.Config{Mode: mode, NoPython: *noPython, JSONPath: *jsonPath, MarkdownPath: *markdownPath, ReportDir: *reportDir, Plain: *plain, Interactive: interactive}, os.Stdin, os.Stdout)
+	if *resumePath != "" {
+		interactive = false
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	_, err := app.Run(app.Config{Mode: mode, NoPython: *noPython, Workers: *workers, JSONPath: *jsonPath, MarkdownPath: *markdownPath, ReportDir: *reportDir, Plain: *plain, Interactive: interactive, Context: ctx, ResumePath: *resumePath}, os.Stdin, os.Stdout)
 	if err != nil {
 		fail(err)
 	}

@@ -1,7 +1,10 @@
 package bench
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/i-execute/GTG/ige"
 )
@@ -26,6 +29,66 @@ func TestQualificationVector(t *testing.T) {
 	for index := range plain {
 		if opened[index] != plain[index] {
 			t.Fatalf("mismatch at %d", index)
+		}
+	}
+}
+
+func TestParallelIGE(t *testing.T) {
+	key := pattern(32, 11)
+	iv := pattern(32, 17)
+	instance, err := ige.New(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Destroy()
+	elapsed, _, err := measureGTG(instance, key, iv, 64, Encrypt, 8, false, 0, 2)
+	if err != nil || elapsed <= 0 {
+		t.Fatalf("elapsed=%d err=%v", elapsed, err)
+	}
+}
+
+func TestMTProtoSealOpen(t *testing.T) {
+	key := pattern(256, 47)
+	for _, direction := range []Direction{Encrypt, Decrypt} {
+		elapsed, checksum, err := measureMTProto(key, 64, direction, 1)
+		if err != nil || elapsed <= 0 || checksum == 0 {
+			t.Fatalf("%s elapsed=%d checksum=%d err=%v", direction, elapsed, checksum, err)
+		}
+	}
+}
+
+func TestCalibration(t *testing.T) {
+	calls := 0
+	iterations, err := calibratedIterations(Fast, time.Nanosecond, func(value int) (int64, error) {
+		calls++
+		return int64(value) * int64(time.Microsecond), nil
+	})
+	if err != nil || iterations < 1000 || calls < 2 {
+		t.Fatalf("iterations=%d calls=%d err=%v", iterations, calls, err)
+	}
+}
+
+func TestRunResume(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	partial, err := Run(Options{Mode: Fast, NoPython: true, Context: ctx, Checkpoint: func(report Report) error {
+		if len(report.Samples) > 0 {
+			cancel()
+		}
+		return nil
+	}})
+	if !errors.Is(err, context.Canceled) || len(partial.Samples) == 0 {
+		t.Fatalf("samples=%d err=%v", len(partial.Samples), err)
+	}
+	resumed, err := Run(Options{Mode: Fast, NoPython: true, Resume: &partial})
+	if err != nil || !resumed.Resumed || len(resumed.Samples) <= len(partial.Samples) {
+		t.Fatalf("partial=%d resumed=%d resumed-flag=%t err=%v", len(partial.Samples), len(resumed.Samples), resumed.Resumed, err)
+	}
+	for index, sample := range resumed.Samples {
+		for prior := 0; prior < index; prior++ {
+			other := resumed.Samples[prior]
+			if sample.Library == other.Library && sample.Operation == other.Operation && sample.Direction == other.Direction && sample.Cache == other.Cache && sample.Size == other.Size && sample.Round == other.Round && sample.Position == other.Position && sample.Order == other.Order {
+				t.Fatal("duplicate resumed sample")
+			}
 		}
 	}
 }

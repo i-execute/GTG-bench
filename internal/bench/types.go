@@ -1,6 +1,9 @@
 package bench
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 type Mode string
 
@@ -25,6 +28,7 @@ const (
 
 type Sample struct {
 	Library    string    `json:"library"`
+	Operation  string    `json:"operation"`
 	Direction  Direction `json:"direction"`
 	Cache      CacheMode `json:"cache"`
 	Size       int       `json:"size"`
@@ -33,6 +37,7 @@ type Sample struct {
 	Order      string    `json:"order"`
 	ElapsedNS  int64     `json:"elapsed_ns"`
 	Iterations int       `json:"iterations"`
+	Workers    int       `json:"workers"`
 	Checksum   uint64    `json:"checksum"`
 	At         time.Time `json:"at"`
 }
@@ -60,16 +65,19 @@ type PairResult struct {
 }
 
 type Environment struct {
-	OS             string   `json:"os"`
-	Arch           string   `json:"arch"`
-	GoVersion      string   `json:"go_version"`
-	CPUs           int      `json:"cpus"`
-	CPUModel       string   `json:"cpu_model,omitempty"`
-	Acceleration   string   `json:"acceleration"`
-	Virtualization string   `json:"virtualization"`
-	Power          string   `json:"power"`
-	Load           string   `json:"load"`
-	Warnings       []string `json:"warnings"`
+	OS                string   `json:"os"`
+	Arch              string   `json:"arch"`
+	GoVersion         string   `json:"go_version"`
+	CPUs              int      `json:"cpus"`
+	CPUModel          string   `json:"cpu_model,omitempty"`
+	CPUFrequencyHz    int64    `json:"cpu_frequency_hz,omitempty"`
+	MemoryBytes       uint64   `json:"memory_bytes,omitempty"`
+	TimerResolutionNS int64    `json:"timer_resolution_ns"`
+	Acceleration      string   `json:"acceleration"`
+	Virtualization    string   `json:"virtualization"`
+	Power             string   `json:"power"`
+	Load              string   `json:"load"`
+	Warnings          []string `json:"warnings"`
 }
 
 type Report struct {
@@ -77,16 +85,23 @@ type Report struct {
 	Started        time.Time       `json:"started"`
 	Finished       time.Time       `json:"finished"`
 	Mode           Mode            `json:"mode"`
+	Workers        int             `json:"workers"`
 	Environment    Environment     `json:"environment"`
 	Qualifications []Qualification `json:"qualifications"`
 	Samples        []Sample        `json:"samples"`
 	Pairs          []PairResult    `json:"pairs"`
 	Warnings       []string        `json:"warnings"`
 	Methodology    string          `json:"methodology"`
+	Resumed        bool            `json:"resumed,omitempty"`
+	ResumeCount    int             `json:"resume_count,omitempty"`
 }
 
 type Options struct {
-	Mode     Mode
-	NoPython bool
-	Progress func(string)
+	Mode       Mode
+	NoPython   bool
+	Workers    int
+	Progress   func(string)
+	Context    context.Context
+	Resume     *Report
+	Checkpoint func(Report) error
 }

@@ -2,10 +2,12 @@ package app
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,11 +17,14 @@ import (
 type Config struct {
 	Mode         bench.Mode
 	NoPython     bool
+	Workers      int
 	JSONPath     string
 	MarkdownPath string
 	ReportDir    string
 	Plain        bool
 	Interactive  bool
+	Context      context.Context
+	ResumePath   string
 }
 
 func Run(config Config, input io.Reader, output io.Writer) (bench.Report, error) {
@@ -49,9 +54,44 @@ func Run(config Config, input io.Reader, output io.Writer) (bench.Report, error)
 			}
 		}
 	}
+	var resume *bench.Report
+	if config.ResumePath != "" {
+		loaded, err := bench.ReadJSON(config.ResumePath)
+		if err != nil {
+			return bench.Report{}, err
+		}
+		resume = &loaded
+		if config.Mode == "" {
+			config.Mode = loaded.Mode
+		}
+		if config.Workers == 0 {
+			config.Workers = loaded.Workers
+		}
+	}
 	if config.Mode == "" {
 		config.Mode = bench.Fast
 	}
+	directory := config.ReportDir
+	if directory == "" {
+		if config.ResumePath != "" {
+			directory = filepath.Dir(config.ResumePath)
+		} else {
+			directory = filepath.Join("reports", time.Now().UTC().Format("20060102-150405Z"))
+		}
+	}
+	jsonPath := config.JSONPath
+	if jsonPath == "" {
+		if config.ResumePath != "" {
+			jsonPath = config.ResumePath
+		} else {
+			jsonPath = filepath.Join(directory, "report.json")
+		}
+	}
+	markdownPath := config.MarkdownPath
+	if markdownPath == "" {
+		markdownPath = filepath.Join(directory, "report.md")
+	}
+	csvPath := filepath.Join(filepath.Dir(jsonPath), "samples.csv")
 	progress := func(message string) {
 		if config.Plain {
 			fmt.Fprintln(output, "[run]", message)
@@ -59,26 +99,13 @@ func Run(config Config, input io.Reader, output io.Writer) (bench.Report, error)
 		}
 		fmt.Fprintf(output, "\r\033[2K\033[38;5;81m›\033[0m %s", message)
 	}
-	report, err := bench.Run(bench.Options{Mode: config.Mode, NoPython: config.NoPython, Progress: progress})
+	checkpoint := func(partial bench.Report) error {
+		return bench.WriteJSON(jsonPath, partial)
+	}
+	report, runErr := bench.Run(bench.Options{Mode: config.Mode, NoPython: config.NoPython, Workers: config.Workers, Progress: progress, Context: config.Context, Resume: resume, Checkpoint: checkpoint})
 	if !config.Plain {
 		fmt.Fprintln(output)
 	}
-	if err != nil {
-		return report, err
-	}
-	directory := config.ReportDir
-	if directory == "" {
-		directory = filepath.Join("reports", report.Started.Format("20060102-150405Z"))
-	}
-	jsonPath := config.JSONPath
-	if jsonPath == "" {
-		jsonPath = filepath.Join(directory, "report.json")
-	}
-	markdownPath := config.MarkdownPath
-	if markdownPath == "" {
-		markdownPath = filepath.Join(directory, "report.md")
-	}
-	csvPath := filepath.Join(filepath.Dir(jsonPath), "samples.csv")
 	if err := bench.WriteJSON(jsonPath, report); err != nil {
 		return report, err
 	}
@@ -87,6 +114,10 @@ func Run(config Config, input io.Reader, output io.Writer) (bench.Report, error)
 	}
 	if err := bench.WriteCSV(csvPath, report); err != nil {
 		return report, err
+	}
+	if runErr != nil {
+		fmt.Fprintln(output, "Partial report saved. Resume with --resume", jsonPath)
+		return report, runErr
 	}
 	showReport(output, report, jsonPath, markdownPath, csvPath, config.Plain)
 	return report, nil
@@ -97,7 +128,7 @@ func menu(input *bufio.Reader, output io.Writer, plain bool) (string, error) {
 	if plain {
 		fmt.Fprintln(output, "GTG-bench")
 		fmt.Fprintf(output, "System: %s/%s, %d logical CPUs, %s\n", env.OS, env.Arch, env.CPUs, env.Virtualization)
-		fmt.Fprintln(output, "1) Fast AES-256-IGE comparison")
+		fmt.Fprintln(output, "1) Fast AES-256-IGE and MTProto Seal/Open run")
 		fmt.Fprintln(output, "2) Full paired comparison")
 		fmt.Fprintln(output, "3) Environment details")
 		fmt.Fprintln(output, "q) Quit")
@@ -107,8 +138,8 @@ func menu(input *bufio.Reader, output io.Writer, plain bool) (string, error) {
 		fmt.Fprintln(output, "\033[1;38;5;81m│  GTG-bench\033[0m  \033[38;5;245mAES-256-IGE local comparison lab                       \033[1;38;5;81m│\033[0m")
 		fmt.Fprintln(output, "\033[1;38;5;81m╰──────────────────────────────────────────────────────────────────────╯\033[0m")
 		fmt.Fprintf(output, "  \033[38;5;110m%s/%s\033[0m  ·  \033[38;5;110m%d CPUs\033[0m  ·  \033[38;5;110m%s\033[0m\n\n", env.OS, env.Arch, env.CPUs, env.Acceleration)
-		fmt.Fprintln(output, "  \033[1;38;5;42m1\033[0m  Fast comparison     focused sizes, hot cache")
-		fmt.Fprintln(output, "  \033[1;38;5;42m2\033[0m  Full comparison     16 B to 64 MiB, hot and cold cache")
+		fmt.Fprintln(output, "  \033[1;38;5;42m1\033[0m  Fast comparison     AES-256-IGE plus MTProto Seal/Open")
+		fmt.Fprintln(output, "  \033[1;38;5;42m2\033[0m  Full comparison     16 B to 64 MiB, paired hot and cold AES")
 		fmt.Fprintln(output, "  \033[1;38;5;42m3\033[0m  Environment         CPU, load, power, virtualization")
 		fmt.Fprintln(output, "  \033[1;38;5;245mq\033[0m  Quit")
 	}
@@ -140,6 +171,13 @@ func showEnvironment(output io.Writer, env bench.Environment, plain bool) {
 	fmt.Fprintf(output, "  OS / architecture: %s / %s\n", env.OS, env.Arch)
 	fmt.Fprintf(output, "  Go runtime:        %s\n", env.GoVersion)
 	fmt.Fprintf(output, "  CPU:               %s\n", env.CPUModel)
+	if env.CPUFrequencyHz > 0 {
+		fmt.Fprintf(output, "  CPU frequency:     %.3f GHz\n", float64(env.CPUFrequencyHz)/1e9)
+	}
+	if env.MemoryBytes > 0 {
+		fmt.Fprintf(output, "  Memory:            %.2f GiB\n", float64(env.MemoryBytes)/(1024*1024*1024))
+	}
+	fmt.Fprintf(output, "  Timer resolution:  %s\n", strconv.FormatInt(env.TimerResolutionNS, 10)+" ns")
 	fmt.Fprintf(output, "  Acceleration:      %s\n", env.Acceleration)
 	fmt.Fprintf(output, "  Virtualization:    %s\n", env.Virtualization)
 	fmt.Fprintf(output, "  Power:             %s\n", env.Power)
@@ -148,7 +186,7 @@ func showEnvironment(output io.Writer, env bench.Environment, plain bool) {
 
 func showReport(output io.Writer, report bench.Report, jsonPath, markdownPath, csvPath string, plain bool) {
 	if plain {
-		fmt.Fprintln(output, "Results")
+		fmt.Fprintf(output, "Results (%d worker(s))\n", report.Workers)
 	} else {
 		fmt.Fprintln(output, "\033[1;38;5;42m✓ Local run complete\033[0m")
 	}
@@ -162,6 +200,9 @@ func showReport(output io.Writer, report bench.Report, jsonPath, markdownPath, c
 	}
 	if len(report.Pairs) == 0 {
 		fmt.Fprintln(output, "  GTG-only samples were retained. No qualified Python comparator was available.")
+	}
+	for _, warning := range report.Warnings {
+		fmt.Fprintln(output, "  Warning:", warning)
 	}
 	fmt.Fprintln(output, "\n  Raw samples:", csvPath)
 	fmt.Fprintln(output, "  JSON report:", jsonPath)

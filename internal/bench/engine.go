@@ -2,28 +2,62 @@ package bench
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"math/rand/v2"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/i-execute/GTG/ige"
+	"github.com/i-execute/GTG/mtproto"
 )
 
 var libraries = []string{"GoyGram", "TgCrypto", "cryptg"}
 
-func Run(options Options) (Report, error) {
+func Run(options Options) (report Report, err error) {
+	ctx := options.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	started := time.Now().UTC()
-	report := Report{
+	resolution := timerResolution()
+	mode := options.Mode
+	if mode != Full {
+		mode = Fast
+	}
+	workers := options.Workers
+	if workers < 1 {
+		workers = 1
+	}
+	report = Report{
 		Schema:      "gtg-bench/v1",
 		Started:     started,
-		Mode:        options.Mode,
+		Mode:        mode,
+		Workers:     workers,
 		Environment: DetectEnvironment(),
-		Methodology: "AES-256-IGE only. Each comparator is byte-qualified against GTG ciphertext and reverse-decryption before timing. Timed pairs alternate ABBA and BAAB. All samples are retained. Ratios are GTG elapsed time divided by comparator elapsed time.",
+		Methodology: "AES-256-IGE and MTProto Seal/Open. Each AES comparator is byte-qualified against GTG ciphertext and reverse-decryption before timing. Timed pairs alternate ABBA and BAAB only in single-worker mode. Small-call iterations are calibrated against the observed timer resolution. All samples are retained. Ratios are GTG elapsed time divided by comparator elapsed time.",
 	}
-	if options.Mode != Full {
-		report.Mode = Fast
+	defer func() {
+		report.Finished = time.Now().UTC()
+	}()
+	if workers > 1 {
+		options.NoPython = true
+		report.Warnings = append(report.Warnings, "parallel worker mode records GTG-only samples; cross-runtime comparator pairs are disabled")
+	}
+	if options.Resume != nil {
+		if options.Resume.Schema != report.Schema || options.Resume.Mode != report.Mode || options.Resume.Workers != report.Workers {
+			return report, fmt.Errorf("resume report schema, mode, or worker count does not match this run")
+		}
+		report.Started = options.Resume.Started
+		report.Samples = append(report.Samples, options.Resume.Samples...)
+		report.Resumed = true
+		report.ResumeCount = options.Resume.ResumeCount + 1
+		report.Warnings = append(report.Warnings, "resumed run retained prior raw samples; new samples use the current environment metadata")
+	}
+	if err := checkpoint(ctx, options, report); err != nil {
+		return report, err
 	}
 	if options.Progress != nil {
 		options.Progress("Qualifying GTG AES-256-IGE")
@@ -122,17 +156,32 @@ func Run(options Options) (Report, error) {
 	}
 	for _, size := range sizes {
 		iterations := iterationsFor(size, report.Mode)
+		if size <= 64 {
+			iterations, err = calibratedIGEIterations(instance, key, iv, size, report.Mode, resolution, workers)
+			if err != nil {
+				return report, err
+			}
+		}
 		for _, direction := range []Direction{Encrypt, Decrypt} {
 			for _, cache := range caches {
 				if options.Progress != nil {
 					options.Progress(fmt.Sprintf("%s %s %s: %s", humanBytes(size), direction, cache, "GTG baseline"))
 				}
 				for round := 0; round < rounds; round++ {
-					elapsed, checksum, runErr := measureGTG(instance, key, iv, size, direction, iterations, cache == Cold, round)
+					if hasSample(report.Samples, Sample{Library: "GTG", Operation: "AES-256-IGE", Direction: direction, Cache: cache, Size: size, Round: round, Position: 0, Order: "baseline"}) {
+						continue
+					}
+					elapsed, checksum, runErr := measureGTG(instance, key, iv, size, direction, iterations, cache == Cold, round, workers)
 					if runErr != nil {
 						return report, runErr
 					}
-					report.Samples = append(report.Samples, Sample{Library: "GTG", Direction: direction, Cache: cache, Size: size, Round: round, Position: 0, Order: "baseline", ElapsedNS: elapsed, Iterations: iterations, Checksum: checksum, At: time.Now().UTC()})
+					sample := Sample{Library: "GTG", Operation: "AES-256-IGE", Direction: direction, Cache: cache, Size: size, Round: round, Position: 0, Order: "baseline", ElapsedNS: elapsed, Iterations: iterations * workers, Workers: workers, Checksum: checksum, At: time.Now().UTC()}
+					if !hasSample(report.Samples, sample) {
+						report.Samples = append(report.Samples, sample)
+						if err := checkpoint(ctx, options, report); err != nil {
+							return report, err
+						}
+					}
 				}
 				for _, library := range libraries {
 					if !qualified[library] || harness == nil {
@@ -149,11 +198,14 @@ func Run(options Options) (Report, error) {
 							orderName = "BAAB"
 						}
 						for position, side := range order {
+							if hasSample(report.Samples, Sample{Library: side, Operation: "AES-256-IGE", Direction: direction, Cache: cache, Size: size, Round: round, Position: position + 1, Order: orderName}) {
+								continue
+							}
 							var elapsed int64
 							var checksum uint64
 							var runErr error
 							if side == "GTG" {
-								elapsed, checksum, runErr = measureGTG(instance, key, iv, size, direction, iterations, cache == Cold, round*4+position)
+								elapsed, checksum, runErr = measureGTG(instance, key, iv, size, direction, iterations, cache == Cold, round*4+position, workers)
 							} else {
 								response, requestErr := harness.measure(library, direction, size, iterations, cache == Cold)
 								if requestErr != nil {
@@ -167,7 +219,10 @@ func Run(options Options) (Report, error) {
 							if runErr != nil {
 								return report, runErr
 							}
-							report.Samples = append(report.Samples, Sample{Library: side, Direction: direction, Cache: cache, Size: size, Round: round, Position: position + 1, Order: orderName, ElapsedNS: elapsed, Iterations: iterations, Checksum: checksum, At: time.Now().UTC()})
+							report.Samples = append(report.Samples, Sample{Library: side, Operation: "AES-256-IGE", Direction: direction, Cache: cache, Size: size, Round: round, Position: position + 1, Order: orderName, ElapsedNS: elapsed, Iterations: iterations * workers, Workers: workers, Checksum: checksum, At: time.Now().UTC()})
+							if err := checkpoint(ctx, options, report); err != nil {
+								return report, err
+							}
 						}
 					}
 					report.Pairs = append(report.Pairs, analyzePair(report.Samples, library, direction, cache, size, rounds))
@@ -175,8 +230,107 @@ func Run(options Options) (Report, error) {
 			}
 		}
 	}
+	if err := appendMTProtoSamples(ctx, &report, options, resolution); err != nil {
+		return report, err
+	}
 	report.Finished = time.Now().UTC()
 	return report, nil
+}
+
+func calibratedIGEIterations(instance *ige.IGE, key, iv []byte, size int, mode Mode, resolution time.Duration, workers int) (int, error) {
+	return calibratedIterations(mode, resolution, func(iterations int) (int64, error) {
+		elapsed, _, err := measureGTG(instance, key, iv, size, Encrypt, iterations, false, 0, workers)
+		return elapsed, err
+	})
+}
+
+func appendMTProtoSamples(ctx context.Context, report *Report, options Options, resolution time.Duration) error {
+	if report.Workers > 1 {
+		report.Warnings = append(report.Warnings, "parallel worker mode currently measures AES-IGE only; MTProto Seal/Open rows require single-worker mode")
+		return nil
+	}
+	key := pattern(256, 47)
+	for _, size := range sizesFor(report.Mode) {
+		if options.Progress != nil {
+			options.Progress(fmt.Sprintf("%s MTProto Seal/Open", humanBytes(size)))
+		}
+		iterations := iterationsFor(size, report.Mode)
+		if size <= 64 {
+			var err error
+			iterations, err = calibratedMTProtoIterations(key, size, report.Mode, resolution)
+			if err != nil {
+				return err
+			}
+		}
+		rounds := 4
+		if report.Mode == Full {
+			rounds = 8
+		}
+		for _, direction := range []Direction{Encrypt, Decrypt} {
+			for round := 0; round < rounds; round++ {
+				operation := "MTProto Seal"
+				if direction == Decrypt {
+					operation = "MTProto Open"
+				}
+				if hasSample(report.Samples, Sample{Library: "GTG", Operation: operation, Direction: direction, Cache: Hot, Size: size, Round: round, Position: 0, Order: "mtproto"}) {
+					continue
+				}
+				elapsed, checksum, err := measureMTProto(key, size, direction, iterations)
+				if err != nil {
+					return err
+				}
+				report.Samples = append(report.Samples, Sample{Library: "GTG", Operation: operation, Direction: direction, Cache: Hot, Size: size, Round: round, Position: 0, Order: "mtproto", ElapsedNS: elapsed, Iterations: iterations, Workers: report.Workers, Checksum: checksum, At: time.Now().UTC()})
+				if err := checkpoint(ctx, options, *report); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func calibratedMTProtoIterations(key []byte, size int, mode Mode, resolution time.Duration) (int, error) {
+	return calibratedIterations(mode, resolution, func(iterations int) (int64, error) {
+		elapsed, _, err := measureMTProto(key, size, Encrypt, iterations)
+		return elapsed, err
+	})
+}
+
+func measureMTProto(key []byte, size int, direction Direction, iterations int) (int64, uint64, error) {
+	box, err := mtproto.New(key)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer box.Destroy()
+	plaintext := pattern(size, 73)
+	if remainder := len(plaintext) & 15; remainder != 0 {
+		plaintext = append(plaintext, make([]byte, 16-remainder)...)
+	}
+	ciphertext := make([]byte, len(plaintext))
+	messageKey, ciphertext, err := box.Seal(ciphertext[:0], plaintext, mtproto.ClientToServer)
+	if err != nil {
+		return 0, 0, err
+	}
+	start := time.Now()
+	var checksum uint64
+	for index := 0; index < iterations; index++ {
+		if direction == Encrypt {
+			messageKey, ciphertext, err = box.Seal(ciphertext[:0], plaintext, mtproto.ClientToServer)
+			if err == nil {
+				checksum ^= uint64(ciphertext[len(ciphertext)-1]) | uint64(messageKey[0])<<8
+			}
+		} else {
+			opened, openErr := box.Open(plaintext[:0], messageKey[:], ciphertext, mtproto.ClientToServer)
+			err = openErr
+			if err == nil {
+				checksum ^= uint64(opened[0]) | uint64(opened[len(opened)-1])<<8
+			}
+		}
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	return time.Since(start).Nanoseconds(), checksum, nil
 }
 
 func qualifySize(instance *ige.IGE, harness *pythonHarness, library string, key, iv []byte, size int) string {
@@ -216,7 +370,14 @@ func qualifySize(instance *ige.IGE, harness *pythonHarness, library string, key,
 	return ""
 }
 
-func measureGTG(instance *ige.IGE, key, iv []byte, size int, direction Direction, iterations int, cold bool, slot int) (int64, uint64, error) {
+func measureGTG(instance *ige.IGE, key, iv []byte, size int, direction Direction, iterations int, cold bool, slot, workers int) (int64, uint64, error) {
+	if workers <= 1 {
+		return measureGTGOne(instance, key, iv, size, direction, iterations, cold, slot)
+	}
+	return measureGTGParallel(key, iv, size, direction, iterations, cold, slot, workers)
+}
+
+func measureGTGOne(instance *ige.IGE, key, iv []byte, size int, direction Direction, iterations int, cold bool, slot int) (int64, uint64, error) {
 	plain := pattern(size, 31)
 	input := plain
 	if direction == Decrypt {
@@ -244,6 +405,89 @@ func measureGTG(instance *ige.IGE, key, iv []byte, size int, direction Direction
 		checksum ^= uint64(output[0])<<8 | uint64(output[len(output)-1])
 	}
 	return time.Since(start).Nanoseconds(), checksum, nil
+}
+
+func measureGTGParallel(key, iv []byte, size int, direction Direction, iterations int, cold bool, slot, workers int) (int64, uint64, error) {
+	plain := pattern(size, 31)
+	input := plain
+	if direction == Decrypt {
+		seed, err := ige.New(key)
+		if err != nil {
+			return 0, 0, err
+		}
+		input = make([]byte, size)
+		err = seed.Encrypt(input, plain, iv)
+		seed.Destroy()
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	if cold {
+		evict(size, slot)
+	}
+	instances := make([]*ige.IGE, workers)
+	outputs := make([][]byte, workers)
+	for index := range instances {
+		instance, err := ige.New(key)
+		if err != nil {
+			for _, opened := range instances {
+				if opened != nil {
+					opened.Destroy()
+				}
+			}
+			return 0, 0, err
+		}
+		instances[index] = instance
+		outputs[index] = make([]byte, size)
+	}
+	defer func() {
+		for _, instance := range instances {
+			instance.Destroy()
+		}
+	}()
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	checksums := make(chan uint64, workers)
+	var group sync.WaitGroup
+	group.Add(workers)
+	for worker := 0; worker < workers; worker++ {
+		worker := worker
+		go func() {
+			defer group.Done()
+			<-start
+			var checksum uint64
+			for index := 0; index < iterations; index++ {
+				var err error
+				if direction == Encrypt {
+					err = instances[worker].Encrypt(outputs[worker], input, iv)
+				} else {
+					err = instances[worker].Decrypt(outputs[worker], input, iv)
+				}
+				if err != nil {
+					errs <- err
+					return
+				}
+				checksum ^= uint64(outputs[worker][0])<<8 | uint64(outputs[worker][len(outputs[worker])-1])
+			}
+			checksums <- checksum
+		}()
+	}
+	started := time.Now()
+	close(start)
+	group.Wait()
+	elapsed := time.Since(started).Nanoseconds()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	close(checksums)
+	var checksum uint64
+	for value := range checksums {
+		checksum ^= value
+	}
+	return elapsed, checksum, nil
 }
 
 func evict(size, slot int) uint64 {
@@ -397,6 +641,25 @@ func driftFlag(values []float64) string {
 		return "first-versus-last paired ratio changed by more than 10%"
 	}
 	return ""
+}
+
+func hasSample(samples []Sample, candidate Sample) bool {
+	for _, sample := range samples {
+		if sample.Library == candidate.Library && sample.Operation == candidate.Operation && sample.Direction == candidate.Direction && sample.Cache == candidate.Cache && sample.Size == candidate.Size && sample.Round == candidate.Round && sample.Position == candidate.Position && sample.Order == candidate.Order {
+			return true
+		}
+	}
+	return false
+}
+
+func checkpoint(ctx context.Context, options Options, report Report) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if options.Checkpoint != nil {
+		return options.Checkpoint(report)
+	}
+	return nil
 }
 
 func errorText(err error) string {

@@ -7,20 +7,27 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func DetectEnvironment() Environment {
 	env := Environment{
-		OS:             runtime.GOOS,
-		Arch:           runtime.GOARCH,
-		GoVersion:      runtime.Version(),
-		CPUs:           runtime.NumCPU(),
-		Acceleration:   acceleration(),
-		Virtualization: virtualization(),
-		Power:          powerState(),
-		Load:           loadState(),
+		OS:                runtime.GOOS,
+		Arch:              runtime.GOARCH,
+		GoVersion:         runtime.Version(),
+		CPUs:              runtime.NumCPU(),
+		TimerResolutionNS: int64(timerResolution()),
+		Acceleration:      acceleration(),
+		Virtualization:    virtualization(),
+		Power:             powerState(),
+		Load:              loadState(),
 	}
 	env.CPUModel = cpuModel()
+	env.CPUFrequencyHz = cpuFrequencyHz()
+	env.MemoryBytes = memoryBytes()
+	if env.TimerResolutionNS > int64(time.Microsecond) {
+		env.Warnings = append(env.Warnings, "timer resolution is above one microsecond; short-call calibration will increase work per sample")
+	}
 	if env.Virtualization != "none detected" {
 		env.Warnings = append(env.Warnings, "virtualized execution detected; compare only runs made in a similar guest configuration")
 	}
@@ -62,6 +69,42 @@ func cpuModel() string {
 		return fallback
 	}
 	return "unavailable"
+}
+
+func cpuFrequencyHz() int64 {
+	data, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 || strings.TrimSpace(strings.ToLower(parts[0])) != "cpu mhz" {
+			continue
+		}
+		mhz, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+		if err == nil && mhz > 0 {
+			return int64(mhz * 1000 * 1000)
+		}
+	}
+	return 0
+}
+
+func memoryBytes() uint64 {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.Fields(line)
+		if len(parts) < 2 || parts[0] != "MemTotal:" {
+			continue
+		}
+		kib, err := strconv.ParseUint(parts[1], 10, 64)
+		if err == nil {
+			return kib * 1024
+		}
+	}
+	return 0
 }
 
 func acceleration() string {
